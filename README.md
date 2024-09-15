@@ -41,7 +41,7 @@ GROQ_API_KEY=<your-api-key>
 ```
 
 
-Usage
+##Usage
 
 To run the ElevenEleven program, simply execute:
 
@@ -57,16 +57,14 @@ python3 main.py
 
 The program will initialize, and you can start conversing with the AI spiritual philosopher. Chat history will be saved automatically, and you can ask the AI to perform its current function—telling the current time in Central Standard Time (CST).
 
-Future Plans
+##Future Plans
 
-Add more advanced function-calling abilities.
-
-Expand the RAG method to improve information retrieval.
-
-Implement more comprehensive conversation features with varied philosophical insights.
+- Add more advanced function-calling abilities.
+- Expand the RAG method to improve information retrieval.
+- Implement more comprehensive conversation features with varied philosophical insights.
 
 
-License
+##License
 
 This project is licensed under the MIT License.
 
