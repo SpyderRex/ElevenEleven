@@ -1,6 +1,7 @@
 import sqlite3
 from datetime import datetime
 from typing import List, Dict, Any
+import json
 
 import spacy
 from groq import Groq
@@ -20,7 +21,7 @@ from config import Config
 cfg = Config()
 
 # Load the SpaCy model for embeddings
-nlp = spacy.load("en_core_web_md")  # Can switch to 'en_core_web_lg' for better results
+nlp = spacy.load("en_core_web_md")  # Using the large model for better embeddings
 
 try:
     with open("system_prompt.txt", "r") as f:
@@ -43,7 +44,7 @@ class Chat11_11:
         self.frequency_penalty = frequency_penalty
         self.presence_penalty = presence_penalty
         self.system_message = {"role": "system", "content": f"{system_prompt}"}
-        self.chat_history = [self.system_message]
+        self.short_term_memory = [self.system_message]
         
         self.db_connection = sqlite3.connect('chat_history.db')
         self.setup_database()
@@ -55,92 +56,61 @@ class Chat11_11:
         (id INTEGER PRIMARY KEY AUTOINCREMENT,
          timestamp TEXT,
          role TEXT,
-         content TEXT)
+         content TEXT,
+         embedding BLOB)
         ''')
         self.db_connection.commit()
 
     def save_message(self, role: str, content: str):
         cursor = self.db_connection.cursor()
         timestamp = datetime.now().isoformat()
-        cursor.execute('INSERT INTO chat_history (timestamp, role, content) VALUES (?, ?, ?)',
-                       (timestamp, role, content))
+        embedding = nlp(content).vector.tobytes()
+        cursor.execute('INSERT INTO chat_history (timestamp, role, content, embedding) VALUES (?, ?, ?, ?)',
+                       (timestamp, role, content, embedding))
         self.db_connection.commit()
 
-    def retrieve_relevant_history(self, query: str, limit: int = 5) -> List[str]:
+    def retrieve_relevant_history(self, query: str, limit: int = 5) -> List[Dict[str, str]]:
         cursor = self.db_connection.cursor()
-        cursor.execute('SELECT content FROM chat_history WHERE role IN ("user", "assistant") ORDER BY timestamp DESC LIMIT 1000')
+        cursor.execute('SELECT role, content, embedding FROM chat_history ORDER BY timestamp DESC LIMIT 1000')
         recent_messages = cursor.fetchall()
 
         if not recent_messages:
             return []
 
-        messages = [msg[0] for msg in recent_messages]
-        
-        # Create embeddings for messages and the query using SpaCy
         query_vector = nlp(query).vector
-        message_vectors = [nlp(message).vector for message in messages]
-
-        # Calculate cosine similarities between the query and each message
-        similarities = np.array([np.dot(query_vector, message_vector) /
-                                (np.linalg.norm(query_vector) * np.linalg.norm(message_vector))
-                                for message_vector in message_vectors])
-
-        # Apply a recency factor
-        recency_factor = np.linspace(0.5, 1, len(similarities))
-        relevance_scores = similarities * recency_factor
         
-        # Get the most relevant messages based on similarity and recency
-        most_relevant_indices = relevance_scores.argsort()[-limit:][::-1]
-        relevant_messages = [messages[i] for i in most_relevant_indices if relevance_scores[i] > 0]
+        similarities = []
+        for role, content, embedding in recent_messages:
+            message_vector = np.frombuffer(embedding, dtype=np.float32)
+            similarity = np.dot(query_vector, message_vector) / (np.linalg.norm(query_vector) * np.linalg.norm(message_vector))
+            similarities.append((similarity, role, content))
 
-        return relevant_messages
+        similarities.sort(reverse=True)
+        return [{"role": role, "content": content} for _, role, content in similarities[:limit]]
 
-    def _manage_history(self, new_message: Dict[str, str]):
-        self.chat_history.append(new_message)
+    def _manage_short_term_memory(self, new_message: Dict[str, str]):
+        self.short_term_memory.append(new_message)
 
-        total_tokens = sum(len(msg["content"].split()) for msg in self.chat_history)
+        total_tokens = sum(len(msg["content"].split()) for msg in self.short_term_memory)
 
-        while total_tokens > self.prompt_token_limit and len(self.chat_history) > 2:
-            relevance_scores = self._calculate_relevance_scores(new_message["content"])
-            least_relevant_index = min(range(1, len(self.chat_history) - 1),
-                                       key=lambda i: relevance_scores[i-1])
-
-            removed_msg = self.chat_history.pop(least_relevant_index)
+        while total_tokens > self.prompt_token_limit and len(self.short_term_memory) > 2:
+            removed_msg = self.short_term_memory.pop(1)  # Remove the oldest non-system message
             total_tokens -= len(removed_msg["content"].split())
-
-    def _calculate_relevance_scores(self, query: str) -> np.ndarray:
-        messages = [msg["content"] for msg in self.chat_history[1:]]
-        
-        # Create embeddings for chat history and query
-        query_vector = nlp(query).vector
-        message_vectors = [nlp(message).vector for message in messages]
-
-        # Calculate cosine similarities
-        similarities = np.array([np.dot(query_vector, message_vector) /
-                                (np.linalg.norm(query_vector) * np.linalg.norm(message_vector))
-                                for message_vector in message_vectors])
-
-        recency_factor = np.linspace(0.5, 1, len(similarities))
-        relevance_scores = similarities * recency_factor
-        
-        return relevance_scores
 
     def send_message(self, user_message: str) -> str:
         self.save_message("user", user_message)
 
         relevant_history = self.retrieve_relevant_history(user_message)
-        context = "\n".join(relevant_history)
+        
+        context_messages = [
+            {"role": "system", "content": "Here's some relevant context from previous conversations:"}
+        ] + relevant_history
 
-        self.chat_history = [self.system_message]
-        if context:
-            self.chat_history.append({"role": "system", "content": f"Relevant context from previous conversations:\n{context}"})
-
-        self.chat_history.append({"role": "user", "content": user_message})
-        self._manage_history({"role": "user", "content": user_message})
+        messages = self.short_term_memory + context_messages + [{"role": "user", "content": user_message}]
 
         try:
             chat_completion = self.client.chat.completions.create(
-                messages=self.chat_history,
+                messages=messages,
                 model=self.model,
                 temperature=self.temperature,
                 max_tokens=self.completion_token_limit,
@@ -156,14 +126,14 @@ class Chat11_11:
                 function_name = response.function_call.name
                 if function_name == "get_date_time":
                     function_response = get_date_time()
-                    self.chat_history.append({
+                    messages.append({
                         "role": "function",
                         "name": function_name,
                         "content": function_response
                     })
                     
                     chat_completion = self.client.chat.completions.create(
-                        messages=self.chat_history,
+                        messages=messages,
                         model=self.model,
                         temperature=self.temperature,
                         max_tokens=self.completion_token_limit,
@@ -188,7 +158,8 @@ class Chat11_11:
             return "An unexpected error occurred. Please try again later."
 
         self.save_message("assistant", response)
-        self._manage_history({"role": "assistant", "content": response})
+        self._manage_short_term_memory({"role": "user", "content": user_message})
+        self._manage_short_term_memory({"role": "assistant", "content": response})
 
         return response
 
